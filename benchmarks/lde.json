@@ -1,10 +1,9 @@
 {
-	"name": "json-benchmarks",
+	"name": "benchmarks",
 	"version": "0.1.0",
 	"dependencies": {
 		"json": { "path": "../" },
-		"ansi": { "path": "../../ansi" },
-		"process2": { "path": "../../process2" },
+		"ansi": { "git": "https://github.com/lde-org/lde" },
 		"lua-cjson": { "luarocks": "lua-cjson" }
 	}
 }
