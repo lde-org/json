@@ -312,6 +312,14 @@ local function writeFlags(opts)
 	return flags
 end
 
+-- yyjson never retains an error struct: it is written during the call and read
+-- straight afterwards, and none of these paths call another yyjson function in
+-- between. One buffer each is therefore enough, and it saves the (surprisingly
+-- costly) fresh ffi allocation per call.
+local readErrBuf = ffi.new(readErrCT) ---@type any
+local writeErrBuf = ffi.new(writeErrCT) ---@type any
+local lenBuf = ffi.new("size_t[1]")
+
 ---@param err any
 local function writeError(err)
 	error("json: " .. (err.msg and ffi.string(err.msg) or "unknown write error"), 3)
@@ -333,11 +341,9 @@ end
 ---@param opts? json.EncodeOptions
 ---@return string
 local function writeCString(fn, arg, opts)
-	local len = ffi.new("size_t[1]")
-	local err = ffi.new(writeErrCT) ---@type any
-	local out = fn(arg, writeFlags(opts), nil, len, err)
-	if out == nil then writeError(err) end
-	local result = ffi.string(out, tonumber(len[0]))
+	local out = fn(arg, writeFlags(opts), nil, lenBuf, writeErrBuf)
+	if out == nil then writeError(writeErrBuf) end
+	local result = ffi.string(out, tonumber(lenBuf[0]))
 	ffi.C.free(out)
 	return result
 end
@@ -697,7 +703,6 @@ function Value:unpack() return unpackNode(handleJson(self)) end
 
 ---@class json.Document
 ---@field __json any yyjson_doc* or nil once freed
----@field __source string the JSON text or file path it came from
 Document = {}
 Document.__index = Document
 
@@ -705,10 +710,9 @@ Document.__index = Document
 ---@param opts? json.DecodeOptions
 ---@return json.Document
 function Document.parse(source, opts)
-	local err = ffi.new(readErrCT) ---@type any
-	local ptr = lib.yyjson_read_opts(source, #source, readFlags(opts), nil, err)
-	if ptr == nil then error(readError(err, true), 2) end
-	return setmetatable({ __json = ptr, __source = source }, Document)
+	local ptr = lib.yyjson_read_opts(source, #source, readFlags(opts), nil, readErrBuf)
+	if ptr == nil then error(readError(readErrBuf, true), 2) end
+	return setmetatable({ __json = ptr }, Document)
 end
 
 --- yyjson reads the file itself, so its contents never pass through Lua.
@@ -716,10 +720,9 @@ end
 ---@param opts? json.DecodeOptions
 ---@return json.Document
 function Document.open(path, opts)
-	local err = ffi.new(readErrCT) ---@type any
-	local ptr = lib.yyjson_read_file(path, readFlags(opts), nil, err)
-	if ptr == nil then error(readError(err, false), 2) end
-	return setmetatable({ __json = ptr, __source = path }, Document)
+	local ptr = lib.yyjson_read_file(path, readFlags(opts), nil, readErrBuf)
+	if ptr == nil then error(readError(readErrBuf, false), 2) end
+	return setmetatable({ __json = ptr }, Document)
 end
 
 ---@return json.Value
