@@ -1,922 +1,1120 @@
-local json   = {}
-local ffi    = require("ffi")
-local strbuf = require("string.buffer")
+-- json: JSON(5) reading, writing and editing for lde, backed by yyjson.
+--
+--   json.decode(text) / json.decodeFile(path) -> json.Value
+--       Lazy handles on the yyjson tree. Nothing is copied into Lua unless you
+--       ask for it with :unpack(), so scraping a few fields out of a large
+--       document stays cheap.
+--
+--   json.encode(value) -> string
+--       Accepts plain Lua data or any handle from json.decode / json.edit.
+--       Lua tables carry no order of their own, so an object's keys are written
+--       in whatever order pairs() yields; json.edit preserves document order.
+--
+--   json.edit.parse(text) / json.edit.open(path) -> json.edit.Document
+--       An editable document: set/add/remove fields in place, then encode() or
+--       save() it back.
+--
+-- yyjson's mutable helpers are `static inline` in yyjson.h, so build.lua
+-- compiles a C shim into the shared library loaded next to this module.
+
+local ffi = require("ffi")
+local bit = require("bit")
 
 ffi.cdef [[
-  void* memchr(const void* s, int c, size_t n);
+  typedef uint32_t yyjson_read_flag;
+  typedef uint32_t yyjson_write_flag;
 
-  /* 16-byte token. All decoded JSON lives in a flat json_tok array.
-     No Lua table allocations for the parsed document. */
-  typedef struct {
-    uint8_t  type;     /* TY_* constants below */
-    uint8_t  flags;    /* string: 1=has_escapes */
-    uint16_t pad;
-    uint32_t next;     /* next sibling index (0 = none) */
-    union {
-      struct { uint32_t str_off; uint32_t str_len; };
-      double   num;
-      struct { uint32_t child;   uint32_t count;   };
-    };
-  } json_tok;
+  typedef struct yyjson_alc {
+    void *(*malloc)(void *ctx, size_t size);
+    void *(*realloc)(void *ctx, void *ptr, size_t old_size, size_t size);
+    void (*free)(void *ctx, void *ptr);
+    void *ctx;
+  } yyjson_alc;
 
-  typedef struct { uint32_t start; uint32_t count; } json_keyslice;
+  typedef union yyjson_val_uni {
+    uint64_t    u64;
+    int64_t     i64;
+    double      f64;
+    const char *str;
+    void       *ptr;
+    size_t      ofs;
+  } yyjson_val_uni;
+
+  typedef struct yyjson_val {
+    uint64_t      tag;
+    yyjson_val_uni uni;
+  } yyjson_val;
+
+  typedef struct yyjson_doc {
+    yyjson_val *root;
+    yyjson_alc  alc;
+    size_t      dat_read;
+    size_t      val_read;
+    char       *str_pool;
+  } yyjson_doc;
+
+  typedef struct yyjson_mut_val {
+    uint64_t      tag;
+    yyjson_val_uni uni;
+    struct yyjson_mut_val *next;
+  } yyjson_mut_val;
+
+  typedef struct yyjson_mut_doc {
+    yyjson_mut_val *root;
+  } yyjson_mut_doc;
+
+  typedef struct yyjson_read_err  { uint32_t code; const char *msg; size_t pos; } yyjson_read_err;
+  typedef struct yyjson_write_err { uint32_t code; const char *msg; } yyjson_write_err;
+
+  void free(void *ptr);
+  int memcmp(const void *s1, const void *s2, size_t n);
+
+  uint32_t yyjson_version(void);
+  yyjson_doc *yyjson_read_opts(const char *dat, size_t len, yyjson_read_flag flg, const yyjson_alc *alc, yyjson_read_err *err);
+  yyjson_doc *yyjson_read_file(const char *path, yyjson_read_flag flg, const yyjson_alc *alc, yyjson_read_err *err);
+  char *yyjson_write_opts(const yyjson_doc *doc, yyjson_write_flag flg, const yyjson_alc *alc, size_t *len, yyjson_write_err *err);
+  char *yyjson_val_write_opts(const yyjson_val *val, yyjson_write_flag flg, const yyjson_alc *alc, size_t *len, yyjson_write_err *err);
+
+  yyjson_mut_doc *yyjson_doc_mut_copy(const yyjson_doc *doc, const yyjson_alc *alc);
+  yyjson_doc *yyjson_mut_doc_imut_copy(const yyjson_mut_doc *doc, const yyjson_alc *alc);
+  void yyjson_mut_doc_free(yyjson_mut_doc *doc);
+  char *yyjson_mut_write_opts(const yyjson_mut_doc *doc, yyjson_write_flag flg, const yyjson_alc *alc, size_t *len, yyjson_write_err *err);
+  char *yyjson_mut_val_write_opts(const yyjson_mut_val *val, yyjson_write_flag flg, const yyjson_alc *alc, size_t *len, yyjson_write_err *err);
+
+  yyjson_mut_val *shim_mut_null(yyjson_mut_doc *doc);
+  yyjson_mut_val *shim_mut_bool(yyjson_mut_doc *doc, int value);
+  yyjson_mut_val *shim_mut_uint(yyjson_mut_doc *doc, uint64_t value);
+  yyjson_mut_val *shim_mut_sint(yyjson_mut_doc *doc, int64_t value);
+  yyjson_mut_val *shim_mut_real(yyjson_mut_doc *doc, double value);
+  yyjson_mut_val *shim_mut_string(yyjson_mut_doc *doc, const char *str, size_t len);
+  yyjson_mut_val *shim_mut_array(yyjson_mut_doc *doc);
+  yyjson_mut_val *shim_mut_object(yyjson_mut_doc *doc);
+
+  yyjson_mut_val *shim_mut_arr_get(yyjson_mut_val *arr, size_t idx);
+  int shim_mut_arr_append(yyjson_mut_val *arr, yyjson_mut_val *val);
+  int shim_mut_arr_insert(yyjson_mut_val *arr, yyjson_mut_val *val, size_t idx);
+  yyjson_mut_val *shim_mut_arr_remove(yyjson_mut_val *arr, size_t idx);
+
+  yyjson_mut_val *shim_mut_obj_get(yyjson_mut_val *obj, const char *key, size_t len);
+  yyjson_mut_val *shim_mut_obj_set(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key, size_t len, yyjson_mut_val *val);
+  yyjson_mut_val *shim_mut_obj_add(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key, size_t len, yyjson_mut_val *val);
+  yyjson_mut_val *shim_mut_obj_remove(yyjson_mut_val *obj, const char *key, size_t len);
+  yyjson_mut_val *shim_mut_obj_iter_init(yyjson_mut_val *obj);
+  yyjson_mut_val *shim_mut_obj_iter_next(yyjson_mut_val *key);
+  yyjson_mut_val *shim_mut_obj_iter_next_key(yyjson_mut_val *key);
 ]]
 
-local C          = ffi.C
+local here = debug.getinfo(1, "S").source:sub(2):match("(.*[/\\])") or ""
+local sep  = string.sub(package.config, 1, 1)
+local libName = sep == "\\" and "yyjson.dll" or (jit.os == "OSX" and "libyyjson.dylib" or "libyyjson.so")
+local lib = ffi.load(here .. libName)
+
 local cast       = ffi.cast
-local u8p        = "const uint8_t*"
+local valPtr     = ffi.typeof("yyjson_val*")
+local u8Ptr      = ffi.typeof("const uint8_t*")
+local readErrCT  = ffi.typeof("yyjson_read_err")
+local writeErrCT = ffi.typeof("yyjson_write_err")
 
--- token type constants
-local TY_NULL    = 0
-local TY_FALSE   = 1
-local TY_TRUE    = 2
-local TY_INT     = 3
-local TY_FLOAT   = 4
-local TY_STRING  = 5
-local TY_ARRAY   = 6
-local TY_OBJECT  = 7
+-- ── value layout ──────────────────────────────────────────────────────────────
+-- yyjson_val and yyjson_mut_val both begin with { uint64_t tag; union {...}; }:
+-- tag % 8 is the type, tag & 0x18 the subtype, tag / 256 the payload size, so
+-- one reader serves both. Reaching a container's children differs:
+--   immutable  children follow the container, and `ofs` holds the byte distance
+--              to the value just past its subtree (unsafe_yyjson_get_next)
+--   mutable    `ptr` is the LAST child, linked through a circular list where
+--              object even links are keys and odd links are values
 
--- ── LuaCATS types ─────────────────────────────────────────────────────────────
+local TY_RAW, TY_NULL, TY_BOOL, TY_NUM, TY_STR, TY_ARR, TY_OBJ = 1, 2, 3, 4, 5, 6, 7
+local SUB_TRUE, SUB_SINT, SUB_REAL = 8, 8, 16
+local VAL_SIZE = 16
 
----@alias json.Primitive   string | number | boolean | nil
----@alias json.Value       json.Primitive | json.Object | json.Array | table
----@alias json.Object      table<string, json.Value>
----@alias json.Array       json.Value[]
----@alias json.KeyStyle    "ident" | "single" | "double"
----@alias json.StringStyle "single" | "double"
+local function tagLow(v) return tonumber(v.tag % 256) end
+local function getType(v) return tagLow(v) % 8 end
+local function getSub(v) return bit.band(tagLow(v), 0x18) end
+local function getLen(v) return tonumber(v.tag / 256) end
 
----@class json.KeyMeta
----@field keyStyle   json.KeyStyle
----@field before     string | nil
----@field between    string | nil
----@field afterColon string | nil
----@field afterValue string | nil
----@field valueStyle json.StringStyle | nil
+local function isContainer(v)
+	local t = getType(v)
+	return t == TY_ARR or t == TY_OBJ
+end
 
----@class json.TableMeta
----@field __trailingComma boolean
----@field __closingTrivia string | nil
----@field [string]        json.KeyMeta
----@field [integer]       json.KeyMeta
-
----@class json.Token : ffi.cdata*
----@field type     integer
----@field flags    integer
----@field next     integer
----@field str_off  integer
----@field str_len  integer
----@field num      number
----@field child    integer
----@field count    integer
-
----@class json.KeySlice : ffi.cdata*
----@field start integer
----@field count integer
-
----@class json.Doc
----@field toks  json.Token[]  token arena
----@field src   string        original source string
----@field ntoks integer       number of tokens used
-
--- ── token arena (per-decode, grown as needed) ─────────────────────────────────
-
-local TOK_INIT   = 4096
-local tok_ct     = ffi.typeof("json_tok")
-local tok_arr_ct = ffi.typeof("json_tok[?]")
-local ks_ct      = ffi.typeof("json_keyslice")
-
----@type ffi.cdata*  json_tok[?]
-local tok_arena  = ffi.new(tok_arr_ct, TOK_INIT)
-local tok_cap    = TOK_INIT
-local tok_top    = 0 -- next free slot
-
-local function tok_alloc()
-	local idx = tok_top
-	tok_top = idx + 1
-	if tok_top > tok_cap then
-		local newcap = tok_cap * 2
-		local newarr = ffi.new(tok_arr_ct, newcap)
-		ffi.copy(newarr, tok_arena, tok_cap * ffi.sizeof(tok_ct))
-		tok_arena = newarr
-		tok_cap   = newcap
+local function stepChild(v)
+	if isContainer(v) then
+		return cast(valPtr, cast(u8Ptr, v) + tonumber(v.uni.ofs))
 	end
-	return idx
+	return v + 1
 end
 
--- ── key arena (append-only) ───────────────────────────────────────────────────
--- Stores ordered key strings for decoded objects (replaces per-object Lua table).
--- Never reset: slices from old decodes remain valid as long as the decoded object lives.
-
----@type string[]
-local key_arena     = {}
-local key_arena_top = 0
-
-local ks_ct         = ffi.typeof("json_keyslice")
-
-local function newKeySlice()
-	local s = ks_ct()
-	s.start = key_arena_top
-	s.count = 0
-	return s
+---@param v any
+---@return string
+local function readString(v)
+	local t = getType(v)
+	if t ~= TY_STR and t ~= TY_RAW then return "" end
+	return ffi.string(v.uni.str, getLen(v))
 end
 
-local function pushKey(slice, key)
-	local idx      = key_arena_top + 1
-	key_arena[idx] = key
-	key_arena_top  = idx
-	slice.count    = slice.count + 1
+---@param v any
+---@return boolean
+local function readBool(v) return getSub(v) == SUB_TRUE end
+
+---@param v any
+---@return number
+local function readNumber(v)
+	local sub = getSub(v)
+	if sub == SUB_REAL then return v.uni.f64 end
+	-- cdata integers convert to Lua numbers, so the annotation holds
+	return sub == SUB_SINT and tonumber(v.uni.i64) or tonumber(v.uni.u64) or 0
 end
 
--- ── weak stores (for encode-side metadata) ────────────────────────────────────
+local TYPE_NAME = { "raw", "null", "boolean", "number", "string", "array", "object" }
 
----@type table<table, string[] | json.KeySlice>
-local keyStore  = setmetatable({}, { __mode = "k" })
----@type table<table, json.TableMeta>
-local metaStore = setmetatable({}, { __mode = "k" })
+---@param v any
+---@return string
+local function typeName(v) return TYPE_NAME[getType(v)] or "unknown" end
 
--- ── encode ────────────────────────────────────────────────────────────────────
+-- ── options ───────────────────────────────────────────────────────────────────
 
----@type table<string, string>
-local dq_esc    = {
-	['"'] = '\\"',
-	['\\'] = '\\\\',
-	['\b'] = '\\b',
-	['\f'] = '\\f',
-	['\n'] = '\\n',
-	['\r'] = '\\r',
-	['\t'] = '\\t'
-}
----@type table<string, string>
-local sq_esc    = {
-	["'"] = "\\'",
-	['\\'] = '\\\\',
-	['\b'] = '\\b',
-	['\f'] = '\\f',
-	['\n'] = '\\n',
-	['\r'] = '\\r',
-	['\t'] = '\\t'
-}
-local function dq_replace(c) return dq_esc[c] or string.format("\\u%04x", string.byte(c)) end
-local function sq_replace(c) return sq_esc[c] or string.format("\\u%04x", string.byte(c)) end
+local READ_ALLOW_TRAILING_COMMAS   = 4
+local READ_ALLOW_COMMENTS          = 8
+local READ_ALLOW_INF_AND_NAN       = 16
+local READ_BIGNUM_AS_RAW           = 128
+local READ_ALLOW_EXT_NUMBER        = 512
+local READ_ALLOW_EXT_ESCAPE        = 1024
+local READ_ALLOW_EXT_WHITESPACE    = 2048
+local READ_ALLOW_SINGLE_QUOTED_STR = 4096
+local READ_ALLOW_UNQUOTED_KEY      = 8192
 
-local dq_needs = ffi.new("uint8_t[256]")
-for i = 0, 31 do dq_needs[i] = 1 end
-dq_needs[34] = 1; dq_needs[92] = 1
+-- Everything JSON5 allows that yyjson can represent.
+local READ_JSON5 = READ_ALLOW_TRAILING_COMMAS + READ_ALLOW_COMMENTS
+	+ READ_ALLOW_INF_AND_NAN + READ_ALLOW_EXT_NUMBER + READ_ALLOW_EXT_ESCAPE
+	+ READ_ALLOW_EXT_WHITESPACE + READ_ALLOW_SINGLE_QUOTED_STR + READ_ALLOW_UNQUOTED_KEY
 
-local sq_needs = ffi.new("uint8_t[256]")
-for i = 0, 31 do sq_needs[i] = 1 end
-sq_needs[39] = 1; sq_needs[92] = 1
+local WRITE_PRETTY                = 1
+local WRITE_ESCAPE_UNICODE        = 2
+local WRITE_ESCAPE_SLASHES        = 4
+local WRITE_ALLOW_INF_AND_NAN     = 8
+local WRITE_INF_AND_NAN_AS_NULL   = 16
+local WRITE_PRETTY_TWO_SPACES     = 64
+local WRITE_NEWLINE_AT_END        = 128
 
----@param tape  string.buffer
----@param s     string
----@param style json.StringStyle | nil
-local function putString(tape, s, style)
-	local len = #s
-	local p   = cast(u8p, s)
-	if style == "single" then
-		tape:put("'")
-		local clean = true
-		for i = 0, len - 1 do
-			if sq_needs[p[i]] == 1 then
-				clean = false; break
-			end
-		end
-		if clean then tape:put(s) else tape:put((string.gsub(s, "[%z\1-\31'\\]", sq_replace))) end
-		tape:put("'")
-	else
-		tape:put('"')
-		local clean = true
-		for i = 0, len - 1 do
-			if dq_needs[p[i]] == 1 then
-				clean = false; break
-			end
-		end
-		if clean then tape:put(s) else tape:put((string.gsub(s, '[%z\1-\31"\\]', dq_replace))) end
-		tape:put('"')
+-- ── types ─────────────────────────────────────────────────────────────────────
+
+---@alias json.Type "raw"|"null"|"boolean"|"number"|"string"|"array"|"object"
+---@alias json.Scalar string|number|boolean|json.null
+---@alias json.Array json.Scalar[]|table[]
+---@alias json.Object table<string, json.Data>
+---@alias json.Data json.Scalar|nil|json.Array|json.Object|json.Value|json.edit.Value
+
+---@class json.null
+
+-- A handle on one value inside a parsed document. It borrows the document's
+-- memory, so it stops working once that document is freed.
+
+---@class json.DecodeOptions
+---@field json5? boolean Accept JSON5 comments, trailing commas and unquoted keys (default true)
+
+---@class json.EncodeOptions
+---@field indent? integer|false Pretty-print with this indent width (default: compact)
+---@field escapeUnicode? boolean Escape non-ASCII as \uXXXX
+---@field escapeSlashes? boolean Escape '/' as '\/'
+---@field newlineAtEnd? boolean Append a trailing newline
+---@field infNan? "value"|"null" Write NaN/Infinity as literals (default) or null
+---@field flags? integer Raw yyjson write flag bitmask (overrides the fields above)
+
+-- ── value handles ─────────────────────────────────────────────────────────────
+
+local json = { null = setmetatable({}, {
+	__tostring = function() return "null" end,
+	__name = "json.null",
+}) }
+
+-- Returned by a json.edit lookup that found nothing: it flows through further
+-- navigation and raises the moment a real value is needed.
+local MISSING = setmetatable({
+	__tostring = function() return "missing" end,
+	__name = "json.missing",
+}, {
+	-- Navigating or reading a missing value is a mistake, but the handle around
+	-- it stays inert so chains still read naturally; __json points back at the
+	-- sentinel so the accessors can report it precisely.
+	__index = function(_, key) error("json: no value at that key", 2) end,
+})
+MISSING.__json = MISSING
+
+local Value, Document, EditValue, EditDocument
+
+---@param value json.Value|json.edit.Value|json.Document
+---@return any
+local function handleJson(value)
+	local node = rawget(value, "__json")
+	-- Values borrow the document's memory, so a freed document frees them too.
+	local doc = rawget(value, "__doc")
+	if node == nil or (doc ~= nil and rawget(doc, "__json") == nil) then
+		error("json: this handle was freed", 3)
 	end
+	if node == MISSING then error("json: no value at that key", 3) end
+	return node
 end
 
----@type fun(tape: string.buffer, v: json.Value, indent: string, level: integer, valueStyle: json.StringStyle | nil)
-local putValue -- forward decl
+---@param node any
+---@param doc json.Document
+---@return json.Value
+local function newValue(node, doc)
+	return setmetatable({ __json = node, __doc = doc }, Value)
+end
 
----@param t table
+---@param node any
+---@param edit json.edit.Document
+---@return json.edit.Value
+local function newEditValue(node, edit)
+	-- A NULL yyjson_mut_val* is truthy cdata, so `node or MISSING` would keep it.
+	if node == nil then node = MISSING end
+	return setmetatable({ __json = node, edit = edit }, EditValue)
+end
+
+---@param value json.edit.Value|json.edit.Document
+---@return any
+local function mutNode(value)
+	local node = rawget(value, "__json")
+	local edit = rawget(value, "edit")
+	if node == nil or (edit ~= nil and rawget(edit, "__json") == nil) then
+		error("json: this handle was freed", 3)
+	end
+	if node == MISSING then error("json: no value at that key", 3) end
+	return node
+end
+
+---@param node any
+---@return boolean
+local function isMissing(node) return node == MISSING or node == nil end
+
+---@param opts? json.DecodeOptions
+---@return integer
+local function readFlags(opts)
+	if opts and opts.json5 == false then return READ_ALLOW_INF_AND_NAN + READ_BIGNUM_AS_RAW end
+	return READ_JSON5
+end
+
+---@param opts? json.EncodeOptions
+---@return integer
+local function writeFlags(opts)
+	if opts and opts.flags ~= nil then return opts.flags end
+	local flags = WRITE_ALLOW_INF_AND_NAN
+	opts = opts or {}
+	local indent = opts.indent
+	if type(indent) == "number" then
+		flags = flags + (indent <= 2 and WRITE_PRETTY_TWO_SPACES or WRITE_PRETTY)
+	end
+	if opts.escapeUnicode then flags = flags + WRITE_ESCAPE_UNICODE end
+	if opts.escapeSlashes then flags = flags + WRITE_ESCAPE_SLASHES end
+	if opts.newlineAtEnd then flags = flags + WRITE_NEWLINE_AT_END end
+	if opts.infNan == "null" then flags = flags + WRITE_INF_AND_NAN_AS_NULL end
+	return flags
+end
+
+---@param err any
+local function writeError(err)
+	error("json: " .. (err.msg and ffi.string(err.msg) or "unknown write error"), 3)
+end
+
+---@param err any
+---@param withPos boolean
+---@return string
+local function readError(err, withPos)
+	local msg = err.msg and ffi.string(err.msg) or "unknown error"
+	if withPos and tonumber(err.pos) > 0 then
+		return ("json: %s at byte %d"):format(msg, tonumber(err.pos))
+	end
+	return "json: " .. msg
+end
+
+---@param fn function
+---@param arg any
+---@param opts? json.EncodeOptions
+---@return string
+local function writeCString(fn, arg, opts)
+	local len = ffi.new("size_t[1]")
+	local err = ffi.new(writeErrCT) ---@type any
+	local out = fn(arg, writeFlags(opts), nil, len, err)
+	if out == nil then writeError(err) end
+	local result = ffi.string(out, tonumber(len[0]))
+	ffi.C.free(out)
+	return result
+end
+
+-- ── plain Lua data -> json ────────────────────────────────────────────────────
+-- The tree is laid out as a flat array of immutable yyjson_val carrying the
+-- sibling offsets the writer follows, then handed to yyjson_val_write_opts,
+-- which only ever reads the root. Strings the buffer points at stay in `held`
+-- so the GC cannot collect them mid-write.
+
+-- A table is an array when its keys are exactly the dense sequence 1..n.
+---@param t any
 ---@return boolean
 local function isArray(t)
-	if keyStore[t] then return false end
+	if type(t) ~= "table" then return false end
+	local count = 0
+	for key in pairs(t) do
+		count = count + 1
+		if type(key) ~= "number" or key % 1 ~= 0 or key < 1 then
+			for _ in pairs(t) do count = count + 1 end
+			return count == 0
+		end
+	end
+	return count == 0 or t[1] ~= nil
+end
+
+--- Key order of a Lua table is unspecified; json.encode writes object keys in
+--- the order pairs() happens to give.
+---@param t table
+---@return string[]
+local function objectKeys(t)
+	local keys = {}
+	for key in pairs(t) do
+		if type(key) == "string" then keys[#keys + 1] = key end
+	end
+	return keys
+end
+
+---@param t table
+---@param array boolean
+---@return fun(): integer|string|nil, any
+local function tableEntries(t, array)
+	local keys, count
+	if array then
+		count = #t
+	else
+		keys = objectKeys(t)
+		count = #keys
+	end
 	local i = 0
-	for _ in pairs(t) do
+	return function()
 		i = i + 1
-		if t[i] == nil then return false end
+		if i > count then return nil end
+		if array then return i, t[i] end
+		local key = keys[i]
+		return key, t[key]
 	end
-	return true
 end
 
----@param tape   string.buffer
----@param t      json.Array
----@param indent string
----@param level  integer
-local function putArray(tape, t, indent, level)
-	local n = #t
-	if n == 0 then
-		tape:put("[]"); return
-	end
-	local meta          = metaStore[t]
-	local nextIndent    = string.rep(indent, level + 1)
-	local defaultBefore = "\n" .. nextIndent
-	local closing       = (meta and meta.__closingTrivia) or ("\n" .. string.rep(indent, level))
-	tape:put("[")
-	for i = 1, n do
-		if i > 1 then tape:put(",") end
-		local km = meta and meta[i]
-		tape:put((km and km.before) or defaultBefore)
-		putValue(tape, t[i], indent, level + 1, km and km.valueStyle)
-		local av = km and km.afterValue
-		if av and av ~= "" then tape:put(av) end
-	end
-	if meta and meta.__trailingComma then tape:put(",") end
-	tape:put(closing); tape:put("]")
-end
-
----@param tape   string.buffer
----@param t      json.Object
----@param indent string
----@param level  integer
-local function putObject(tape, t, indent, level)
-	local ks         = keyStore[t]
-	local meta       = metaStore[t]
-	local nextIndent = string.rep(indent, level + 1)
-
-	if not ks then
-		local keys = {}
-		for k in pairs(t) do keys[#keys + 1] = k end
-		table.sort(keys)
-		local n = #keys
-		if n == 0 then
-			tape:put("{}"); return
-		end
-		tape:put("{\n")
-		for i = 1, n do
-			if i > 1 then tape:put(",\n") end
-			tape:put(nextIndent); putString(tape, tostring(keys[i]), nil)
-			tape:put(": "); putValue(tape, t[keys[i]], indent, level + 1, nil)
-		end
-		tape:put("\n"); tape:put(string.rep(indent, level)); tape:put("}")
-		return
-	end
-
-	local isSlice = ffi.istype(ks_ct, ks)
-	local nkeys   = isSlice and ks.count or #ks
-	if nkeys == 0 then
-		tape:put("{}"); return
-	end
-
-	if not meta then
-		tape:put("{\n")
-		if isSlice then
-			local base = ks.start
-			for i = 1, nkeys do
-				if i > 1 then tape:put(",\n") end
-				local k = key_arena[base + i]
-				tape:put(nextIndent); putString(tape, k, nil)
-				tape:put(": "); putValue(tape, t[k], indent, level + 1, nil)
-			end
-		else
-			for i = 1, nkeys do
-				if i > 1 then tape:put(",\n") end
-				local k = ks[i]
-				tape:put(nextIndent); putString(tape, k, nil)
-				tape:put(": "); putValue(tape, t[k], indent, level + 1, nil)
-			end
-		end
-		tape:put("\n"); tape:put(string.rep(indent, level)); tape:put("}")
-		return
-	end
-
-	tape:put("{")
-	if isSlice then
-		local base = ks.start
-		for i = 1, nkeys do
-			if i > 1 then tape:put(",") end
-			local k = key_arena[base + i]; local km = meta[k]
-			tape:put((km and km.before) or " ")
-			local ks2 = km and km.keyStyle
-			if ks2 == "ident" then tape:put(k) else putString(tape, k, ks2) end
-			tape:put((km and km.between) or ""); tape:put(":")
-			tape:put((km and km.afterColon) or " ")
-			putValue(tape, t[k], indent, level + 1, km and km.valueStyle)
-			local av = km and km.afterValue; if av and av ~= "" then tape:put(av) end
-		end
-	else
-		for i = 1, nkeys do
-			if i > 1 then tape:put(",") end
-			local k = ks[i]; local km = meta[k]
-			tape:put((km and km.before) or " ")
-			local ks2 = km and km.keyStyle
-			if ks2 == "ident" then tape:put(k) else putString(tape, k, ks2) end
-			tape:put((km and km.between) or ""); tape:put(":")
-			tape:put((km and km.afterColon) or " ")
-			putValue(tape, t[k], indent, level + 1, km and km.valueStyle)
-			local av = km and km.afterValue; if av and av ~= "" then tape:put(av) end
-		end
-	end
-	if meta.__trailingComma then tape:put(",") end
-	tape:put(meta.__closingTrivia or " "); tape:put("}")
-end
-
-local floor = math.floor
-local huge  = math.huge
-
-putValue    = function(tape, v, indent, level, valueStyle)
-	local t = type(v)
-	if t == "nil" or v == json.null then
-		tape:put("null")
+---@param slot any
+---@param value string|number|boolean
+local function setLeaf(slot, value)
+	local t = type(value)
+	if t == "string" then
+		slot.tag = #value * 256 + TY_STR
+		slot.uni.str = value
 	elseif t == "boolean" then
-		tape:put(v and "true" or "false")
-	elseif t == "number" then
-		if v ~= v then
-			tape:put("NaN")
-		elseif v == huge then
-			tape:put("Infinity")
-		elseif v == -huge then
-			tape:put("-Infinity")
-		else
-			tape:put(tostring(v))
-		end
-	elseif t == "string" then
-		putString(tape, v, valueStyle)
-	elseif t == "table" then
-		if isArray(v) then
-			putArray(tape, v, indent, level)
-		else
-			putObject(tape, v, indent, level)
-		end
+		slot.tag = value and (TY_BOOL + SUB_TRUE) or TY_BOOL
+	elseif value ~= value or value == math.huge or value == -math.huge then
+		slot.tag = TY_NUM + SUB_REAL
+		slot.uni.f64 = value
+	elseif value % 1 ~= 0 then
+		slot.tag = TY_NUM + SUB_REAL
+		slot.uni.f64 = value
+	elseif value >= 0 and value < 18446744073709551616.0 then
+		slot.tag = TY_NUM
+		slot.uni.u64 = value
+	elseif value >= -9223372036854775808.0 and value < 0 then
+		slot.tag = TY_NUM + SUB_SINT
+		slot.uni.i64 = value
 	else
-		error("unsupported type: " .. t)
+		slot.tag = TY_NUM + SUB_REAL
+		slot.uni.f64 = value
 	end
 end
 
----@param t     table
----@param key   string
----@param value json.Value
-function json.addField(t, key, value)
-	t[key] = value
-	local ks = keyStore[t]
-	if not ks or ffi.istype(ks_ct, ks) then
-		local arr = {}
-		if ks then for i = 1, ks.count do arr[i] = key_arena[ks.start + i] end end
-		keyStore[t] = arr; ks = arr
+local countNodes
+
+---@param value any
+---@param array boolean
+---@return integer
+local function countChildren(value, array)
+	local total, it = 0, tableEntries(value, array)
+	while true do
+		local key, child = it()
+		if key == nil then break end
+		total = total + (array and 1 or 1 + countNodes(key)) + countNodes(child)
 	end
-	ks[#ks + 1] = key
+	return total
 end
 
----@param t   table
----@param key string
-function json.removeField(t, key)
-	t[key] = nil
-	local ks = keyStore[t]
-	if not ks or ffi.istype(ks_ct, ks) then return end
-	for i, k in ipairs(ks) do
-		if k == key then
-			table.remove(ks, i); return
-		end
-	end
+---@param value any
+---@return integer
+function countNodes(value)
+	if value == nil or value == json.null or type(value) ~= "table" then return 1 end
+	return 1 + countChildren(value, isArray(value))
 end
 
----@param value json.Value
+---@param value any
+---@param opts? json.EncodeOptions
 ---@return string
-function json.encode(value)
-	local tape = strbuf.new()
-	putValue(tape, value, "\t", 0, nil)
-	tape:put("\n")
-	return tape:tostring()
-end
+local function encodeTable(value, opts)
+	if value == nil or value == json.null then return "null" end
+	local buf = ffi.new("yyjson_val[?]", countNodes(value) + 1)
+	local held = {}
+	local index = 0
 
--- ── decoder ───────────────────────────────────────────────────────────────────
-
----@type ffi.cdata*
-local src_ptr
----@type integer
-local src_len
----@type string
-local src_s
-
-local ws_tab = ffi.new("uint8_t[256]")
-ws_tab[32] = 1; ws_tab[9] = 1; ws_tab[10] = 1; ws_tab[13] = 1
-
-local ident_tab = ffi.new("uint8_t[256]")
-for i = 48, 57 do ident_tab[i] = 1 end
-for i = 65, 90 do ident_tab[i] = 1 end
-for i = 97, 122 do ident_tab[i] = 1 end
-ident_tab[95] = 1; ident_tab[36] = 1
-
----@param pos integer 1-based
----@return integer    1-based
-local function skipWS(pos)
-	local i = pos - 1
-	while i < src_len and ws_tab[src_ptr[i]] == 1 do i = i + 1 end
-	return i + 1
-end
-
----@param pos integer 1-based, sitting on '/'
----@param ts  integer trivia start
----@return string trivia
----@return integer    1-based after trivia
-local function collectComments(pos, ts)
-	while pos <= src_len do
-		if src_ptr[pos - 1] ~= 47 then break end
-		local b1 = src_ptr[pos]
-		if b1 == 47 then
-			local nl = C.memchr(src_ptr + pos + 1, 10, src_len - pos - 1)
-			pos = nl ~= nil and (cast(u8p, nl) - src_ptr + 2) or (src_len + 1)
-		elseif b1 == 42 then
-			local p = src_ptr + pos + 1; local rem = src_len - pos - 1; local found = false
-			while rem > 0 do
-				local star = C.memchr(p, 42, rem); if star == nil then error("unterminated block comment") end
-				local sp = cast(u8p, star); local off = sp - src_ptr
-				if off + 1 < src_len and src_ptr[off + 1] == 47 then
-					pos = off + 3; found = true; break
-				end
-				p = sp + 1; rem = src_len - (off + 1)
+	local function put(value)
+		index = index + 1
+		local at = index
+		-- json.null is a table, so it has to be recognised before the container
+		-- branch below would walk it as an empty object.
+		if value == nil or value == json.null then
+			held[#held + 1] = value
+			buf[at].tag = TY_NULL
+			return
+		end
+		if type(value) ~= "table" then
+			held[#held + 1] = value
+			setLeaf(buf[at], value)
+			return
+		end
+		local array = isArray(value)
+		local children, it = 0, tableEntries(value, array)
+		while true do
+			local key, child = it()
+			if key == nil then break end
+			children = children + 1
+			if not array then
+				index = index + 1
+				held[#held + 1] = key
+				setLeaf(buf[index], key)
 			end
-			if not found then error("unterminated block comment") end
-		else
-			break
+			put(child)
 		end
-		pos = skipWS(pos)
+		-- Index into buf again: the recursion above wrote the following slots,
+		-- and a slot captured before the loop aliases the last of them.
+		buf[at].tag = children * 256 + (array and TY_ARR or TY_OBJ)
+		-- Immutable containers carry the byte distance to the value just past
+		-- their subtree.
+		buf[at].uni.ofs = (index - at + 1) * VAL_SIZE
 	end
-	return string.sub(src_s, ts, pos - 1), pos
+
+	put(value)
+	-- Slot 0 stays empty so the root occupies a real slot and `index` stays the
+	-- count of written slots.
+	return writeCString(lib.yyjson_val_write_opts, buf + 1, opts)
 end
 
----@param pos integer 1-based
----@return string|nil trivia
----@return integer    1-based after trivia
-local function collectTrivia(pos)
-	local npos = skipWS(pos)
-	if npos <= src_len and src_ptr[npos - 1] == 47 then return collectComments(npos, pos) end
-	if npos == pos then return nil, npos end
-	return string.sub(src_s, pos, npos - 1), npos
-end
-
----@type fun(pos:integer): integer, integer  -- returns (tok_idx, new_pos)
-local parseValue -- forward decl
-
----@type table<integer,string>
-local escapeMap = {
-	[34] = '"',
-	[39] = "'",
-	[92] = '\\',
-	[47] = '/',
-	[98] = '\b',
-	[102] = '\f',
-	[110] = '\n',
-	[114] = '\r',
-	[116] = '\t'
-}
-
--- Parse a quoted string into a token. Returns (tok_idx, new_pos).
----@param pos integer 1-based, pointing at opening quote
----@return integer tok_idx
----@return integer new_pos
-local function parseString(pos)
-	local quote = src_ptr[pos - 1]
-	local i     = pos + 1
-	local pq    = C.memchr(src_ptr + i - 1, quote, src_len - i + 1)
-	if pq == nil then error("unterminated string") end
-	local q_off   = cast(u8p, pq) - src_ptr
-	local has_esc = C.memchr(src_ptr + i - 1, 92, q_off - (i - 1)) ~= nil
-
-	local idx     = tok_alloc()
-	local tok     = tok_arena[idx]
-	tok.type      = TY_STRING
-	tok.flags     = has_esc and 1 or 0
-	tok.next      = 0
-	tok.str_off   = i - 1 -- 0-based offset into src_s
-	tok.str_len   = q_off - (i - 1)
-
-	if not has_esc then
-		return idx, q_off + 2
-	end
-
-	-- advance past the full escaped string
-	local j = i
-	while j <= src_len do
-		local rem = src_len - j + 1; local base = src_ptr + j - 1
-		local pbs = C.memchr(base, 92, rem); local pq2 = C.memchr(base, quote, rem)
-		local bs_off = pbs ~= nil and (cast(u8p, pbs) - src_ptr) or src_len
-		local q_off2 = pq2 ~= nil and (cast(u8p, pq2) - src_ptr) or src_len
-		if q_off2 <= bs_off then
-			tok.str_len = q_off2 - (i - 1) -- store full span including escapes
-			return idx, q_off2 + 2
+local function toMut(value, doc)
+	if getmetatable(value) == EditValue then return rawget(value, "__json") end
+	if value == nil or value == json.null then return lib.shim_mut_null(doc) end
+	local t = type(value)
+	if t == "string" then return lib.shim_mut_string(doc, value, #value) end
+	if t == "boolean" then return lib.shim_mut_bool(doc, value and 1 or 0) end
+	if t == "number" then
+		if value % 1 == 0 and value >= 0 and value < 18446744073709551616.0 then
+			return lib.shim_mut_uint(doc, value)
 		end
-		local esc = src_ptr[bs_off + 1]
-		j = esc == 117 and bs_off + 7 or bs_off + 3
-	end
-	error("unterminated string")
-end
-
--- Materialise a string token into a Lua string (allocates only when called).
----@param tok json.Token
----@return string
-local function tokToString(tok)
-	local off = tok.str_off + 1 -- 1-based start of content
-	if tok.flags == 0 then
-		return string.sub(src_s, off, off + tok.str_len - 1)
-	end
-	-- unescape: walk the raw span, replacing escape sequences
-	local buf = {}
-	local i   = off
-	local lim = off + tok.str_len -- exclusive end (past last content byte)
-	while i < lim do
-		local rem    = lim - i
-		local base   = src_ptr + i - 1
-		local pbs    = C.memchr(base, 92, rem) -- backslash
-		local bs_off = pbs ~= nil and (cast(u8p, pbs) - src_ptr) or (lim - 1)
-		if bs_off >= lim - 1 then
-			-- no more backslashes, copy remainder
-			if i <= lim - 1 then buf[#buf + 1] = string.sub(src_s, i, lim - 1) end
-			break
+		if value % 1 == 0 and value >= -9223372036854775808.0 and value < 0 then
+			return lib.shim_mut_sint(doc, value)
 		end
-		if bs_off > i - 1 then buf[#buf + 1] = string.sub(src_s, i, bs_off) end
-		local esc = src_ptr[bs_off + 1]
-		if esc == 117 then
-			buf[#buf + 1] = string.char(tonumber(string.sub(src_s, bs_off + 2, bs_off + 5), 16))
-			i = bs_off + 7
-		elseif esc == 10 or esc == 13 then
-			i = bs_off + 3
-		else
-			buf[#buf + 1] = escapeMap[esc] or string.char(esc); i = bs_off + 3
-		end
+		return lib.shim_mut_real(doc, value)
 	end
-	return table.concat(buf)
-end
+	if t ~= "table" then error("json: cannot encode a " .. t, 3) end
 
----@param pos integer 1-based
----@return integer tok_idx
----@return integer new_pos
-local function parseIdentifier(pos)
-	local i = pos - 1
-	local b = src_ptr[i]
-	if not ((b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95 or b == 36) then
-		error("invalid identifier at pos " .. pos)
-	end
-	i = i + 1
-	while i < src_len and ident_tab[src_ptr[i]] == 1 do i = i + 1 end
-	local idx   = tok_alloc()
-	local tok   = tok_arena[idx]
-	tok.type    = TY_STRING
-	tok.flags   = 0
-	tok.next    = 0
-	tok.str_off = pos - 1 -- 0-based
-	tok.str_len = i - (pos - 1)
-	return idx, i + 1
-end
-
----@param pos integer 1-based
----@return integer tok_idx
----@return integer new_pos
-local function parseNumber(pos)
-	local i = pos - 1; local neg = src_ptr[i] == 45
-	if neg then i = i + 1 end
-	local b = src_ptr[i]
-	local idx = tok_alloc()
-	local tok = tok_arena[idx]
-	tok.next = 0
-	if b >= 48 and b <= 57 then
-		if b == 48 then
-			local b2 = src_ptr[i + 1]; if b2 == 120 or b2 == 88 then goto slow end
+	local array = isArray(value)
+	local it = tableEntries(value, array)
+	if array then
+		local root = lib.shim_mut_array(doc)
+		while true do
+			local key, child = it()
+			if key == nil then break end
+			lib.shim_mut_arr_append(root, toMut(child, doc))
 		end
-		local n = 0
-		while i < src_len do
-			b = src_ptr[i]; if b < 48 or b > 57 then break end; n = n * 10 + (b - 48); i = i + 1
-		end
-		if b ~= 46 and b ~= 101 and b ~= 69 then
-			tok.type = TY_INT; tok.num = neg and -n or n; return idx, i + 1
-		end
+		return root
 	end
-	::slow::
-	local numStr = string.match(src_s, "^-?0[xX]%x+", pos)
-		or string.match(src_s, "^[+-]?%d+%.?%d*[eE]?[+-]?%d*", pos)
-	local sub = string.sub(src_s, pos, pos + 8)
-	local v
-	if sub:sub(1, 8) == "Infinity" then
-		v = huge; numStr = sub:sub(1, 8)
-	elseif sub:sub(1, 9) == "+Infinity" then
-		v = huge; numStr = sub:sub(1, 9)
-	elseif sub:sub(1, 9) == "-Infinity" then
-		v = -huge; numStr = sub:sub(1, 9)
-	elseif sub:sub(1, 3) == "NaN" then
-		v = 0 / 0; numStr = sub:sub(1, 3)
-	else
-		v = tonumber(numStr)
-	end
-	tok.type = TY_FLOAT; tok.num = v
-	return idx, pos + #numStr
-end
-
----@param pos integer 1-based, pointing at '['
----@return integer tok_idx
----@return integer new_pos
-local function parseArray(pos)
-	local idx          = tok_alloc()
-	local tok          = tok_arena[idx]
-	tok.type           = TY_ARRAY
-	tok.next           = 0
-	tok.child          = 0
-	tok.count          = 0
-
-	local trivia, npos = collectTrivia(pos + 1); pos = npos
-	if src_ptr[pos - 1] == 93 then return idx, pos + 1 end
-
-	local first_child = 0
-	local prev_idx    = 0
-	local count       = 0
-
+	local root = lib.shim_mut_object(doc)
 	while true do
-		local ci, npos2 = parseValue(pos); pos = npos2
-		count = count + 1
-		if first_child == 0 then first_child = ci end
-		if prev_idx ~= 0 then tok_arena[prev_idx].next = ci end
-		prev_idx = ci
-
-		local _, npos3 = collectTrivia(pos); pos = npos3
-		local c = src_ptr[pos - 1]
-		if c == 93 then break end
-		if c ~= 44 then error("expected ',' or ']'") end
-		pos = pos + 1
-		local _, npos4 = collectTrivia(pos); pos = npos4
-		if src_ptr[pos - 1] == 93 then break end
+		local key, child = it()
+		if key == nil then break end
+		lib.shim_mut_obj_add(doc, root, key, #key, toMut(child, doc))
 	end
-
-	tok_arena[idx].child = first_child
-	tok_arena[idx].count = count
-	return idx, pos + 1
+	return root
 end
 
----@param pos integer 1-based, pointing at '{'
----@return integer tok_idx
----@return integer new_pos
-local function parseObject(pos)
-	local idx          = tok_alloc()
-	local tok          = tok_arena[idx]
-	tok.type           = TY_OBJECT
-	tok.next           = 0
-	tok.child          = 0
-	tok.count          = 0
+-- ── read path ─────────────────────────────────────────────────────────────────
 
-	local trivia, npos = collectTrivia(pos + 1); pos = npos
-	if src_ptr[pos - 1] == 125 then return idx, pos + 1 end
-
-	local first_child = 0
-	local prev_idx    = 0
-	local count       = 0
-
-	while true do
-		-- key
-		local c = src_ptr[pos - 1]
-		local ki
-		if c == 34 or c == 39 then
-			ki, pos = parseString(pos)
-		else
-			ki, pos = parseIdentifier(pos)
+---@param node any
+---@return any
+local function unpackNode(node)
+	local t = getType(node)
+	if t == TY_NULL then return json.null end
+	if t == TY_BOOL then return readBool(node) end
+	if t == TY_NUM then return readNumber(node) end
+	if t == TY_STR or t == TY_RAW then return readString(node) end
+	if t == TY_ARR then
+		local out = {}
+		local child = node + 1
+		for i = 1, getLen(node) do
+			out[i] = unpackNode(child)
+			child = stepChild(child)
 		end
-
-		local _, npos2 = collectTrivia(pos); pos = npos2
-		if src_ptr[pos - 1] ~= 58 then error("expected ':'") end
-		pos = pos + 1
-		local _, npos3 = collectTrivia(pos); pos = npos3
-
-		-- value
-		local vi, npos4 = parseValue(pos); pos = npos4
-
-		-- link: key.next -> value, value.next -> next key (set later)
-		tok_arena[ki].next = vi
-		count = count + 1
-		if first_child == 0 then first_child = ki end
-		if prev_idx ~= 0 then tok_arena[prev_idx].next = ki end
-		prev_idx = vi -- next sibling chain continues from value
-
-		local _, npos5 = collectTrivia(pos); pos = npos5
-		c = src_ptr[pos - 1]
-		if c == 125 then break end
-		if c ~= 44 then error("expected ',' or '}'") end
-		pos = pos + 1
-		local _, npos6 = collectTrivia(pos); pos = npos6
-		if src_ptr[pos - 1] == 125 then break end
+		return out
 	end
-
-	tok_arena[idx].child = first_child
-	tok_arena[idx].count = count
-	return idx, pos + 1
-end
-
-parseValue = function(pos)
-	local _, npos = collectTrivia(pos); pos = npos
-	local c = src_ptr[pos - 1]
-	if c == 34 or c == 39 then
-		return parseString(pos)
-	elseif c == 123 then
-		return parseObject(pos)
-	elseif c == 91 then
-		return parseArray(pos)
-	elseif c == 116 then
-		local idx = tok_alloc(); tok_arena[idx].type = TY_TRUE; tok_arena[idx].next = 0
-		return idx, pos + 4
-	elseif c == 102 then
-		local idx = tok_alloc(); tok_arena[idx].type = TY_FALSE; tok_arena[idx].next = 0
-		return idx, pos + 5
-	elseif c == 110 then
-		local idx = tok_alloc(); tok_arena[idx].type = TY_NULL; tok_arena[idx].next = 0
-		return idx, pos + 4
-	else
-		return parseNumber(pos)
+	local out = {}
+	local key = node + 1
+	for _ = 1, getLen(node) do
+		out[readString(key)] = unpackNode(stepChild(key))
+		key = stepChild(stepChild(key))
 	end
+	return out
 end
 
--- ── public API ────────────────────────────────────────────────────────────────
-
-json.null = setmetatable({}, { __tostring = function() return "null" end })
-
--- Returns a doc table: { toks=tok_arena, src=src_s, root=root_idx }
--- The token arena is reused on the next decodeDocument call, so copy if you need persistence.
----@param s string
----@return json.Doc
-function json.decodeDocument(s)
-	tok_top       = 0
-	src_s         = s
-	src_len       = #s
-	src_ptr       = cast(u8p, s)
-	local root, _ = parseValue(1)
-	return { toks = tok_arena, src = s, root = root }
-end
-
--- Materialise a token into a plain Lua value (allocates strings/tables).
--- For hot paths prefer json.iter / json.get / json.str / json.num.
----@param doc  json.Doc
----@param idx  integer  token index
----@return json.Value
-local function materialise(doc, idx)
-	local tok = doc.toks[idx]
-	local ty  = tok.type
-	if ty == TY_NULL then
-		return json.null
-	elseif ty == TY_FALSE then
-		return false
-	elseif ty == TY_TRUE then
-		return true
-	elseif ty == TY_INT or ty == TY_FLOAT then
-		return tok.num
-	elseif ty == TY_STRING then
-		-- re-bind src for tokToString
-		src_s   = doc.src
-		src_ptr = cast(u8p, src_s)
-		src_len = #src_s
-		return tokToString(tok)
-	elseif ty == TY_ARRAY then
-		local arr = {}
-		local ci  = tok.child
-		local i   = 0
-		while ci ~= 0 do
-			i = i + 1
-			arr[i] = materialise(doc, ci)
-			ci = doc.toks[ci].next
-		end
-		return arr
-	elseif ty == TY_OBJECT then
-		local obj     = {}
-		local keys    = {}
-		keyStore[obj] = keys
-		local ki      = tok.child
-		while ki ~= 0 do
-			src_s           = doc.src; src_ptr = cast(u8p, src_s); src_len = #src_s
-			local k         = tokToString(doc.toks[ki])
-			local vi        = doc.toks[ki].next
-			obj[k]          = materialise(doc, vi)
-			keys[#keys + 1] = k
-			ki              = doc.toks[vi].next
-		end
-		return obj
+---@param node any
+---@param key string|integer
+---@return any|nil
+local function nodeGet(node, key)
+	local t = getType(node)
+	if t == TY_ARR then
+		if type(key) ~= "number" or key < 1 or key % 1 ~= 0 or key > getLen(node) then return nil end
+		local child = node + 1
+		for _ = 2, key do child = stepChild(child) end
+		return child
 	end
-	error("unknown token type " .. ty)
-end
-
--- Iterate children of an array or object token.
--- For arrays:  yields (index, child_tok_idx)
--- For objects: yields (key_string, value_tok_idx)
----@param doc json.Doc
----@param idx integer  token index of array or object
----@return fun(): (string|integer|nil), integer|nil
-function json.iter(doc, idx)
-	local tok = doc.toks[idx]
-	local ty  = tok.type
-	if ty == TY_ARRAY then
-		local ci = tok.child
-		local i  = 0
-		return function()
-			if ci == 0 then return nil end
-			i         = i + 1
-			local cur = ci
-			ci        = doc.toks[ci].next
-			return i, cur
-		end
-	elseif ty == TY_OBJECT then
-		local ki = tok.child
-		src_s = doc.src; src_ptr = cast(u8p, src_s); src_len = #src_s
-		return function()
-			if ki == 0 then return nil end
-			local k  = tokToString(doc.toks[ki])
-			local vi = doc.toks[ki].next
-			ki       = doc.toks[vi].next
-			return k, vi
-		end
-	end
-	return function() return nil end
-end
-
--- Get a child token by key (object) or index (array). Returns token index or nil.
----@param doc json.Doc
----@param idx integer
----@param key string | integer
----@return integer | nil
-function json.get(doc, idx, key)
-	local tok = doc.toks[idx]
-	local ty  = tok.type
-	if ty == TY_ARRAY then
-		local ci = tok.child; local i = 0
-		while ci ~= 0 do
-			i = i + 1
-			if i == key then return ci end
-			ci = doc.toks[ci].next
-		end
-	elseif ty == TY_OBJECT then
-		src_s = doc.src; src_ptr = cast(u8p, src_s); src_len = #src_s
-		local ki = tok.child
-		while ki ~= 0 do
-			if tokToString(doc.toks[ki]) == key then return doc.toks[ki].next end
-			ki = doc.toks[doc.toks[ki].next].next
-		end
+	if t ~= TY_OBJ or type(key) ~= "string" then return nil end
+	local len = #key
+	local pair = node + 1
+	for _ = 1, getLen(node) do
+		if getLen(pair) == len and ffi.C.memcmp(pair.uni.str, key, len) == 0 then return pair + 1 end
+		pair = stepChild(stepChild(pair))
 	end
 	return nil
 end
 
--- Get the Lua string value of a string token.
----@param doc json.Doc
----@param idx integer
----@return string
-function json.str(doc, idx)
-	src_s = doc.src; src_ptr = cast(u8p, src_s); src_len = #src_s
-	return tokToString(doc.toks[idx])
+---@alias json.edit.Value json.EditValue
+---@alias json.edit.Document json.EditDocument
+
+--- A handle on one value inside a parsed document. It borrows the document's
+--- memory, so it stops working once that document is freed.
+---@class json.Value
+---@field __json any yyjson_val*
+---@field __doc json.Document
+Value = {}
+Value.__index = Value
+
+--- "null", "boolean", "number", "string", "array" or "object".
+---@return json.Type
+function Value:type() return typeName(handleJson(self)) end
+
+---@param kind json.Type
+---@return boolean
+function Value:is(kind) return typeName(handleJson(self)) == kind end
+
+--- Elements for arrays and objects, bytes for strings, 0 otherwise.
+---@return integer
+function Value:size()
+	local node = handleJson(self)
+	if isContainer(node) or getType(node) == TY_STR or getType(node) == TY_RAW then
+		return getLen(node)
+	end
+	return 0
 end
 
--- Get the numeric value of a number token.
----@param doc json.Doc
----@param idx integer
----@return number
-function json.num(doc, idx)
-	return doc.toks[idx].num
+--- Fetch a child by array index or object key; raises when it is missing unless
+--- a default is given.
+---@param key string|integer
+---@param default? any
+---@return json.Value|any
+function Value:get(key, default)
+	local child = nodeGet(handleJson(self), key)
+	if child == nil then
+		if default ~= nil then return default end
+		error(("json: no %s %s"):format(type(key) == "number" and "index" or "key", tostring(key)), 2)
+	end
+	return newValue(child, self.__doc)
 end
 
--- Get the type name of a token.
----@param doc json.Doc
----@param idx integer
----@return "null"|"boolean"|"number"|"string"|"array"|"object"
-function json.type(doc, idx)
-	local ty = doc.toks[idx].type
-	if ty == TY_NULL then
-		return "null"
-	elseif ty == TY_FALSE or ty == TY_TRUE then
-		return "boolean"
-	elseif ty == TY_INT or ty == TY_FLOAT then
-		return "number"
-	elseif ty == TY_STRING then
-		return "string"
-	elseif ty == TY_ARRAY then
-		return "array"
-	else
-		return "object"
+--- The scalar this value holds, or the value itself for arrays and objects.
+---@return json.Scalar|json.Value
+function Value:val()
+	local node = handleJson(self)
+	local t = getType(node)
+	if t == TY_NULL then return json.null end
+	if t == TY_BOOL then return readBool(node) end
+	if t == TY_NUM then return readNumber(node) end
+	if t == TY_STR or t == TY_RAW then return readString(node) end
+	return self
+end
+
+--- Iterate children: arrays yield (index, value), objects (key, value). The key
+--- is never nil, which is what a generic for needs to keep going.
+---@return fun(): integer|string|nil, json.Value|nil
+function Value:children()
+	local node = handleJson(self)
+	if not isContainer(node) then return function() return nil, nil end end
+	local doc, remaining = self.__doc, getLen(node)
+	local child, key, index = node + 1, node + 1, 0
+	local obj = getType(node) == TY_OBJ
+	return function()
+		if remaining <= 0 then return nil end
+		remaining = remaining - 1
+		if not obj then
+			index = index + 1
+			local item = child
+			child = stepChild(item)
+			return index, newValue(item, doc)
+		end
+		local name = readString(key)
+		local item = stepChild(key)
+		key = stepChild(item)
+		return name, newValue(item, doc)
 	end
 end
 
--- Materialise the full document into Lua tables (old behaviour, allocates).
----@param doc json.Doc
----@param doc json.Doc
----@return json.Value
-function json.materialise(doc)
-	return materialise(doc, doc.root)
+---@return fun(): string|nil
+function Value:keys()
+	if not self:is("object") then return function() return nil end end
+	local children = self:children()
+	local function nextKey() ---@return string|nil
+		return children()
+	end
+	return nextKey
 end
 
--- Decode JSON string into plain Lua tables (allocating).
----@param s string
----@return json.Value
-function json.decode(s)
-	local doc = json.decodeDocument(s)
-	return materialise(doc, doc.root)
+--- Yields (_, value); the constant first value keeps a generic for from
+--- stopping on a value that happens to be falsey.
+---@return fun(): boolean, json.Value|nil
+function Value:values()
+	local kind = self:type()
+	if kind ~= "array" and kind ~= "object" then return function() return false, nil end end
+	local children = self:children()
+	---@return boolean, json.Value|nil
+	return function()
+		local _, value = children()
+		if value == nil then return false, nil end
+		return true, value
+	end
 end
 
--- Encode a json.Doc back to a JSON string (materialises then encodes).
----@param doc json.Doc
+--- Copy this value (and everything under it) into Lua tables. Array indices and
+--- json.null arrive as-is; the key order of objects is kept for json.encode.
+---@return any
+function Value:unpack() return unpackNode(handleJson(self)) end
+
+-- ── read documents ────────────────────────────────────────────────────────────
+
+---@class json.Document
+---@field __json any yyjson_doc* or nil once freed
+---@field __source string the JSON text or file path it came from
+Document = {}
+Document.__index = Document
+
+---@param source string
+---@param opts? json.DecodeOptions
+---@return json.Document
+function Document.parse(source, opts)
+	local err = ffi.new(readErrCT) ---@type any
+	local ptr = lib.yyjson_read_opts(source, #source, readFlags(opts), nil, err)
+	if ptr == nil then error(readError(err, true), 2) end
+	return setmetatable({ __json = ptr, __source = source }, Document)
+end
+
+--- yyjson reads the file itself, so its contents never pass through Lua.
+---@param path string
+---@param opts? json.DecodeOptions
+---@return json.Document
+function Document.open(path, opts)
+	local err = ffi.new(readErrCT) ---@type any
+	local ptr = lib.yyjson_read_file(path, readFlags(opts), nil, err)
+	if ptr == nil then error(readError(err, false), 2) end
+	return setmetatable({ __json = ptr, __source = path }, Document)
+end
+
+---@return json.Value
+function Document:root() return newValue(handleJson(self).root, self) end
+
+---@param opts? json.EncodeOptions
 ---@return string
-function json.encodeDocument(doc)
-	return json.encode(materialise(doc, doc.root))
+function Document:encode(opts) return writeCString(lib.yyjson_write_opts, handleJson(self), opts) end
+
+--- Bytes read from the source, and how many values it contains.
+---@return integer bytes
+---@return integer values
+function Document:stats()
+	local doc = handleJson(self)
+	return tonumber(doc.dat_read) or 0, tonumber(doc.val_read) or 0
 end
+
+function Document:free()
+	local ptr = rawget(self, "__json")
+	if ptr == nil then return end
+	rawset(self, "__json", nil)
+	-- yyjson_doc_free is inline: the allocator and the string pool are ours.
+	local alc = ptr.alc
+	if ptr.str_pool ~= nil then alc.free(alc.ctx, ptr.str_pool) end
+	alc.free(alc.ctx, ptr)
+end
+
+Document.__gc = Document.free
+
+-- ── edit path ─────────────────────────────────────────────────────────────────
+
+--- A handle on one value inside an editable document.
+---@class json.EditValue
+---@field __json any yyjson_mut_val*
+---@field edit json.edit.Document
+EditValue = {}
+EditValue.__index = EditValue
+
+--- "null", "boolean", "number", "string", "array", "object" or "missing".
+---@return json.Type|"missing"
+function EditValue:type()
+	if isMissing(rawget(self, "__json")) then return "missing" end
+	return typeName(mutNode(self))
+end
+
+---@param kind json.Type
+---@return boolean
+function EditValue:is(kind) return self:type() == kind end
+
+--- Elements for arrays and objects, bytes for strings, 0 otherwise.
+---@return integer
+function EditValue:size()
+	local node = rawget(self, "__json")
+	if isMissing(node) or not (isContainer(node) or getType(node) == TY_STR) then return 0 end
+	return getLen(node)
+end
+
+--- Fetch a child by array index or object key. A missing key yields a handle
+--- that raises when used, so lookups can be chained.
+---@param key string|integer
+---@return json.edit.Value
+function EditValue:get(key)
+	local node = mutNode(self)
+	local edit = self.edit
+	local t = getType(node)
+	if t == TY_ARR then
+		if type(key) ~= "number" or key < 1 or key % 1 ~= 0 or key > getLen(node) then
+			return newEditValue(nil, edit)
+		end
+		return newEditValue(lib.shim_mut_arr_get(node, key - 1), edit)
+	end
+	if t == TY_OBJ and type(key) == "string" then
+		return newEditValue(lib.shim_mut_obj_get(node, key, #key), edit)
+	end
+	return newEditValue(nil, edit)
+end
+
+--- The scalar this value holds, or the value itself for arrays and objects.
+---@return json.Scalar|json.edit.Value
+function EditValue:val()
+	local node = mutNode(self)
+	local t = getType(node)
+	if t == TY_NULL then return json.null end
+	if t == TY_BOOL then return readBool(node) end
+	if t == TY_NUM then return readNumber(node) end
+	if t == TY_STR then return readString(node) end
+	return self
+end
+
+--- Iterate children in document order: arrays yield (index, value), objects
+--- (key, value).
+---@return fun(): integer|string|nil, json.edit.Value|nil
+function EditValue:children()
+	local node = rawget(self, "__json")
+	if isMissing(node) or not isContainer(node) then return function() return nil end end
+	local edit = self.edit
+	if getType(node) == TY_ARR then
+		local remaining, index = getLen(node), 0
+		return function()
+			if remaining <= 0 then return nil end
+			remaining = remaining - 1
+			index = index + 1
+			return index, newEditValue(lib.shim_mut_arr_get(node, index - 1), edit)
+		end
+	end
+	-- Keys form a circular sibling list. Counting the steps is more robust than
+	-- comparing pointers: after n steps the cursor is back at the head.
+	local remaining = getLen(node)
+	local cursor = lib.shim_mut_obj_iter_init(node)
+	return function()
+		if remaining <= 0 or cursor == nil then return nil end
+		remaining = remaining - 1
+		local key = lib.shim_mut_obj_iter_next_key(cursor)
+		local value = lib.shim_mut_obj_iter_next(key)
+		cursor = key
+		return readString(key), newEditValue(value, edit)
+	end
+end
+
+---@return fun(): string|nil
+function EditValue:keys()
+	if not self:is("object") then return function() return nil end end
+	local children = self:children()
+	---@return string|nil
+	return function()
+		local key = children()
+		---@cast key string|nil
+		return key
+	end
+end
+
+--- Yields (_, value); the constant first value keeps a generic for from
+--- stopping on a value that happens to be falsey.
+---@return fun(): boolean, json.edit.Value|nil
+function EditValue:values()
+	local kind = self:type()
+	if kind ~= "array" and kind ~= "object" then return function() return false, nil end end
+	local children = self:children()
+	return function()
+		local _, value = children()
+		if value == nil then return false, nil end
+		return true, value
+	end
+end
+
+--- Copy this value (and everything under it) into Lua tables.
+---@return any
+function EditValue:unpack()
+	local node = mutNode(self)
+	local t = getType(node)
+	if t == TY_NULL then return json.null end
+	if t == TY_BOOL then return readBool(node) end
+	if t == TY_NUM then return readNumber(node) end
+	if t == TY_STR then return readString(node) end
+	local out = {}
+	local children = self:children()
+	while true do
+		local key, value = children()
+		if key == nil or value == nil then break end
+		out[key] = value:unpack()
+	end
+	return out
+end
+
+--- Set a child, appending it when it does not exist yet: a key for objects, a
+--- 1-based index for arrays. Object keys keep their position when replaced.
+---@param key string|integer
+---@param value json.Data
+---@return json.edit.Value
+function EditValue:set(key, value)
+	local node = mutNode(self)
+	local edit = self.edit
+	local doc = edit:docPtr()
+	local t = getType(node)
+	if t == TY_ARR then
+		if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+			error("json: array index must be a positive integer", 2)
+		end
+		local mut = toMut(value, doc)
+		if key > getLen(node) then
+			lib.shim_mut_arr_append(node, mut)
+			return newEditValue(mut, edit)
+		end
+		lib.shim_mut_arr_remove(node, key - 1)
+		lib.shim_mut_arr_insert(node, mut, key - 1)
+		return newEditValue(mut, edit)
+	end
+	if t ~= TY_OBJ then error("json: cannot set a child on a " .. self:type(), 2) end
+	if type(key) ~= "string" then error("json: object keys must be strings", 2) end
+	return newEditValue(lib.shim_mut_obj_set(doc, node, key, #key, toMut(value, doc)), edit)
+end
+
+-- Append a key/value pair to an object, even when the key already exists.
+---@param key string
+---@param value json.Data
+---@return json.edit.Value
+function EditValue:add(key, value)
+	local node = mutNode(self)
+	if getType(node) ~= TY_OBJ then error("json: add needs an object", 2) end
+	if type(key) ~= "string" then error("json: object keys must be strings", 2) end
+	local edit = self.edit
+	return newEditValue(lib.shim_mut_obj_add(edit:docPtr(), node, key, #key, toMut(value, edit:docPtr())), edit)
+end
+
+--- Append a value to an array.
+---@param value json.Data
+---@return json.edit.Value
+function EditValue:append(value)
+	local node = mutNode(self)
+	if getType(node) ~= TY_ARR then error("json: append needs an array", 2) end
+	local edit = self.edit
+	local mut = toMut(value, edit:docPtr())
+	lib.shim_mut_arr_append(node, mut)
+	return newEditValue(mut, edit)
+end
+
+--- Insert a value into an array at a 1-based index, moving the rest along.
+---@param index integer
+---@param value json.Data
+---@return json.edit.Value
+function EditValue:insert(index, value)
+	local node = mutNode(self)
+	if getType(node) ~= TY_ARR then error("json: insert needs an array", 2) end
+	if type(index) ~= "number" or index < 1 or index % 1 ~= 0 then
+		error("json: array index must be a positive integer", 2)
+	end
+	local edit = self.edit
+	local mut = toMut(value, edit:docPtr())
+	lib.shim_mut_arr_insert(node, mut, index - 1)
+	return newEditValue(mut, edit)
+end
+
+--- Remove a child and hand back what was removed.
+---@param key string|integer
+---@return json.edit.Value
+function EditValue:remove(key)
+	local node = mutNode(self)
+	local t = getType(node)
+	if t == TY_OBJ then
+		if type(key) ~= "string" then error("json: object keys must be strings", 2) end
+		return newEditValue(lib.shim_mut_obj_remove(node, key, #key), self.edit)
+	end
+	if t == TY_ARR then
+		if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+			error("json: array index must be a positive integer", 2)
+		end
+		return newEditValue(lib.shim_mut_arr_remove(node, key - 1), self.edit)
+	end
+	return newEditValue(nil, self.edit)
+end
+
+---@class json.EditDocument
+---@field __json any yyjson_mut_doc* or nil once freed
+---@field path string? set by json.edit.open, used by save()
+EditDocument = {}
+EditDocument.__index = EditDocument
+
+--- Parse JSON (or JSON5) text into an editable document.
+---@param text string
+---@param opts? json.DecodeOptions
+---@return json.edit.Document
+function EditDocument.parse(text, opts)
+	local doc = Document.parse(text, opts)
+	return EditDocument.import(doc)
+end
+
+---@param doc json.Document
+---@return json.edit.Document
+function EditDocument.import(doc)
+	local mutable = lib.yyjson_doc_mut_copy(handleJson(doc), nil)
+	doc:free()
+	if mutable == nil then error("json: failed to make an editable copy", 2) end
+	return setmetatable({ __json = mutable }, EditDocument)
+end
+
+--- Open a JSON (or JSON5) file for editing; the document remembers the path so
+--- save() can write it back.
+---@param path string
+---@param opts? json.DecodeOptions
+---@return json.edit.Document
+function EditDocument.open(path, opts)
+	local edit = EditDocument.import(Document.open(path, opts))
+	edit.path = path
+	return edit
+end
+
+---@return any
+function EditDocument:docPtr()
+	local ptr = rawget(self, "__json")
+	if ptr == nil then error("json: this document has been freed", 2) end
+	return ptr
+end
+
+---@return json.edit.Value
+function EditDocument:root()
+	local doc = self:docPtr()
+	if doc.root == nil then
+		-- yyjson needs a root before it can write anything.
+		doc.root = lib.shim_mut_object(doc)
+	end
+	return newEditValue(doc.root, self)
+end
+
+--- Snapshot the document as a read-only json.Document.
+---@return json.Document
+function EditDocument:toDocument()
+	local ptr = lib.yyjson_mut_doc_imut_copy(self:docPtr(), nil)
+	if ptr == nil then error("json: failed to copy the document", 2) end
+	return setmetatable({ __json = ptr }, Document)
+end
+
+---@param opts? json.EncodeOptions
+---@return string
+function EditDocument:encode(opts)
+	return writeCString(lib.yyjson_mut_write_opts, self:docPtr(), opts)
+end
+
+--- Write the document back to its file through a temp file, so a crash mid-write
+--- cannot truncate the original.
+---@param path? string Defaults to the path given to json.edit.open.
+---@param opts? json.EncodeOptions
+function EditDocument:save(path, opts)
+	path = path or self.path
+	if path == nil then error("json: no path to save to", 2) end
+	local tmp = path .. ".lde-json-tmp"
+	local file = io.open(tmp, "wb")
+	if file == nil then error("json: cannot write " .. tmp, 2) end
+	file:write(self:encode(opts))
+	file:close()
+	if not os.rename(tmp, path) then
+		os.remove(tmp)
+		error("json: cannot replace " .. path, 2)
+	end
+	self.path = path
+end
+
+function EditDocument:free()
+	local doc = rawget(self, "__json")
+	if doc == nil then return end
+	rawset(self, "__json", nil)
+	lib.yyjson_mut_doc_free(doc)
+end
+
+EditDocument.__gc = EditDocument.free
+
+-- ── public api ────────────────────────────────────────────────────────────────
+
+--- Parse JSON (or JSON5) text and hand back a lazy handle on its root value.
+---@param source string|json.Document
+---@param opts? json.DecodeOptions
+---@return json.Value
+function json.decode(source, opts)
+	if getmetatable(source) == Document then return source --[[@as json.Document]]:root() end
+	return Document.parse(source --[[@as string]], opts):root()
+end
+
+--- Read and parse a JSON file, returning a lazy handle on its root value.
+---@param path string
+---@param opts? json.DecodeOptions
+---@return json.Value
+function json.decodeFile(path, opts) return Document.open(path, opts):root() end
+
+--- Serialize plain Lua data, or any handle from json.decode / json.edit.
+---@param value json.Data|json.edit.Value
+---@param opts? json.EncodeOptions
+---@return string
+function json.encode(value, opts)
+	local mt = getmetatable(value)
+	if mt == Value then
+		return writeCString(lib.yyjson_val_write_opts, handleJson(value --[[@as json.Value]]), opts)
+	end
+	if mt == EditValue then
+		return writeCString(lib.yyjson_mut_val_write_opts, mutNode(value --[[@as json.edit.Value]]), opts)
+	end
+	return encodeTable(value, opts)
+end
+
+json.version = ("%d.%d.%d"):format(
+	bit.rshift(lib.yyjson_version(), 16),
+	bit.band(bit.rshift(lib.yyjson_version(), 8), 0xFF),
+	bit.band(lib.yyjson_version(), 0xFF))
+
+json.Value = Value
+json.Document = Document
+
+---@class json.edit
+---@field Value json.EditValue
+---@field Document json.EditDocument
+---@field open fun(path: string, opts?: json.DecodeOptions): json.EditDocument
+---@field parse fun(text: string, opts?: json.DecodeOptions): json.EditDocument
+json.edit = {
+	Document = EditDocument,
+	Value = EditValue,
+	open = EditDocument.open,
+	parse = EditDocument.parse,
+}
 
 return json
