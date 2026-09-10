@@ -4,6 +4,8 @@
 	"dependencies": {
 		"json": { "path": "../" },
 		"ansi": { "git": "https://github.com/lde-org/lde" },
-		"lua-cjson": { "luarocks": "lua-cjson" }
+		"lua-cjson": { "luarocks": "lua-cjson" },
+		"rapidjson": { "luarocks": "rapidjson" },
+		"lde-build": { "git": "https://github.com/lde-org/lde" }
 	}
 }

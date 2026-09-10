@@ -87,3 +87,68 @@ Value handles: `type`, `is`, `size`, `get`, `val`, `children`, `keys`, `values`,
 
 Read options: `{ json5 = false }` for strict JSON.
 Write options: `{ indent, escapeUnicode, escapeSlashes, newlineAtEnd, infNan }`.
+
+## Benchmarks
+
+`benchmarks/` has two suites: `lde run` measures this package against a pure-C
+yyjson baseline (compiled from the same yyjson revision), and
+`lde run src/compare.lua` measures it against yyjson in C, lua-rapidjson,
+lua-cjson, rxi/json.lua, qjson and the pure-Lua predecessor of this package.
+Both share one fixture set, so every number is over identical bytes. The C
+baseline is best-effort: without a toolchain it is left out of the run.
+
+Overhead against calling yyjson directly from C, on a 33 KB document:
+
+| | ours | C | ratio |
+|---|---|---|---|
+| decode | 64 µs | 41 µs | 1.57x |
+| decode + read a nested field | 68 µs | 41 µs | 1.65x |
+| encode a parsed tree | 37 µs | 39 µs | **0.95x** |
+
+On a 39-byte object the same comparison is 220 ns vs 51 ns for decode and
+**43 ns vs 47 ns for encode** — the encoder is a single `yyjson_write_opts` call
+on both sides, so there is nothing left to lose there.
+
+The parse gap is what the Lua side costs around a native call that C makes
+directly. Measured on that 39-byte document:
+
+| step | cost |
+|---|---|
+| `yyjson_read_opts` + free (native) | 82 ns |
+| building the two handles it returns | ~2 ns |
+| `:get("name"):val()` | ~75 ns |
+| total `json.decode` | 220 ns |
+
+Two things that were worth fixing, both now done: the error and length structs
+handed to yyjson are module-level buffers rather than a fresh `ffi.new` per call
+(worth ~20 ns a call), and the document no longer retains the source string it
+never used. Handle construction turned out to be negligible — LuaJIT allocates
+the table and sets the metatable in under 2 ns — so the remaining gap is the
+`ffi` call sequence itself plus dispatch on the value methods.
+
+`:unpack()` on the same document costs 800 µs: that is not overhead, that is
+where every Lua string and table actually gets built.
+
+Against everything else, on the same document:
+
+| | decode | encode |
+|---|---|---|
+| yyjson, in C | 39 µs (0.6x) | 37 µs (1.0x) |
+| **ours (yyjson through ffi)** | **64 µs** | **37 µs** |
+| lua-rapidjson | 364 µs (5.6x) | 218 µs (5.9x) |
+| lua-cjson | 486 µs (7.6x) | 625 µs (17x) |
+| rxi/json.lua | 1101 µs (17x) | 1335 µs (36x) |
+| qjson | 1417 µs (22x) | 282 µs (7.6x) |
+| pure-Lua predecessor | 1079 µs (17x) | 601 µs (16x) |
+
+lua-rapidjson is the closest competitor, and it is the useful yardstick: it
+wraps a C++ parser the same way this package wraps a C one, so the two are
+directly comparable. Ours is 5.6x faster at decoding and 5.9x at encoding here,
+which is mostly the parser behind it — yyjson's lazy DOM keeps string data in the
+source buffer, while RapidJSON allocates a node per value.
+
+On a 39-byte object the ordering tightens to lua-rapidjson 421 ns, ours 248 ns,
+lua-cjson 538 ns, and raw yyjson 52 ns. Reading one field out of a document you
+have already decoded in Lua is also slower than a single-pass decoder at that
+size, because those have already built the table by then. Our advantage is a
+large-document one.

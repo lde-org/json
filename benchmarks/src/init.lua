@@ -1,118 +1,110 @@
-local ffi = require("ffi")
 local ansi = require("ansi")
 local json = require("json")
-local cjson = require("cjson")
+local fixtures = require("benchmarks.fixtures")
 
--- ── timer ─────────────────────────────────────────────────────────────────────
+local now = ansi.now
 
--- os.clock() reports CPU time, which is enough to compare these single-threaded
--- paths against each other and against cjson. (clock_gettime cannot be declared
--- here: lde's own runtime already declares it with a different struct type, and
--- an ffi.cdef conflict is an error.)
-local clock = os.clock
-local function now() return clock() * 1e9 end
-
--- ── bench helper ──────────────────────────────────────────────────────────────
+-- ── helpers ───────────────────────────────────────────────────────────────────
 
 local function bench(label, fn, iters)
 	iters = iters or 1000
 	for _ = 1, math.max(1, math.floor(iters / 10)) do fn() end
 	local t0 = now()
 	for _ = 1, iters do fn() end
-	local ns = (now() - t0) / iters
-	ansi.printf("  {gray}%-40s{reset} {bold}%8.2f ns/op{reset}  {gray}(%d iters){reset}",
-		label, ns, iters)
+	ansi.printf("  {gray}%-30s{reset} {bold}%10.1f ns/op{reset}  {gray}(%d iters){reset}",
+		label, (now() - t0) / iters * 1e9, iters)
 end
 
--- ── fixtures ──────────────────────────────────────────────────────────────────
-
-local SMALL = '{"name":"Alice","age":30,"active":true}'
-
-local MEDIUM = json.encode({
-	users = (function()
-		local t = {}
-		for i = 1, 20 do
-			t[i] = { id = i, name = "user" .. i, score = i * 1.5, active = i % 2 == 0 }
-		end
-		return t
-	end)(),
-})
-
-local LARGE = json.encode((function()
-	local t = {}
-	for i = 1, 500 do
-		t[i] = { id = i, name = "item" .. i, value = i * 3.14, tags = { "a", "b", "c" } }
+-- Median of `reps` runs, so a GC pause or a scheduler hiccup cannot define a row.
+local function benchNs(fn, iters, reps)
+	reps = reps or 5
+	for _ = 1, math.max(1, math.floor(iters / 10)) do fn() end
+	local samples = {}
+	for _ = 1, reps do
+		local t0 = now()
+		for _ = 1, iters do fn() end
+		samples[#samples + 1] = (now() - t0) / iters * 1e9
 	end
-	return t
-end)())
+	table.sort(samples)
+	return samples[math.ceil(#samples / 2)]
+end
 
-local JSON5_SRC = [[{
-	// application config
-	name: 'myapp',
-	version: '1.0.0',
-	/* feature flags */
-	features: {
-		darkMode: true,
-		beta: false,
-	},
-	ports: [8080, 8443,],
-}]]
-
-local SMALL_T  = json.decode(SMALL):unpack()
-local MEDIUM_T = json.decode(MEDIUM):unpack()
-local LARGE_T  = json.decode(LARGE):unpack()
+local function vsC(luaNs, cNs)
+	if not cNs or cNs == 0 then return "" end
+	return ansi.format("  {gray}x%.2f vs C{reset}", luaNs / cNs)
+end
 
 -- ── run ───────────────────────────────────────────────────────────────────────
 
-ansi.printf("\n{bold}json.decode{reset}")
-bench("small object (~40 B)", function() json.decode(SMALL) end, 20000)
-bench("medium array (~20 objs)", function() json.decode(MEDIUM) end, 2000)
-bench("large array (~500 objs)", function() json.decode(LARGE) end, 100)
-bench("json5 with comments", function() json.decode(JSON5_SRC) end, 5000)
+fixtures.write()
+local baseline = fixtures.readBaseline()
 
-ansi.printf("\n{bold}json.decode + scrape one field (lazy){reset}")
-bench("small: root:get('name')", function() json.decode(SMALL):get("name"):val() end, 20000)
-bench("medium: users[10].name", function()
-	json.decode(MEDIUM):get("users"):get(10):get("name"):val()
-end, 2000)
-bench("large: [250].tags[2]", function()
-	json.decode(LARGE):get(250):get("tags"):get(2):val()
-end, 100)
+local small, medium, large = fixtures.SMALL, fixtures.MEDIUM, fixtures.LARGE
+local decoded = {
+	small = json.decode(small),
+	medium = json.decode(medium),
+	large = json.decode(large),
+}
 
-ansi.printf("\n{bold}json.decode:unpack{reset}")
-bench("small object", function() json.decode(SMALL):unpack() end, 5000)
-bench("medium array", function() json.decode(MEDIUM):unpack() end, 500)
-bench("large array", function() json.decode(LARGE):unpack() end, 20)
+ansi.printf("\n{bold}yyjson through the ffi wrapper{reset}")
 
-ansi.printf("\n{bold}json.encode (Lua tables){reset}")
-bench("small object", function() json.encode(SMALL_T) end, 5000)
-bench("medium array", function() json.encode(MEDIUM_T) end, 500)
-bench("large array", function() json.encode(LARGE_T) end, 20)
+ansi.printf("\n{gray}decode: parse the document, build no Lua data{reset}")
+for _, size in ipairs(fixtures.SIZES) do
+	local src = fixtures.source(size)
+	local ns = benchNs(function() json.decode(src) end, fixtures.ITERS[size])
+	ansi.printf("  {gray}%-30s{reset} {bold}%10.1f ns/op{reset}%s", size, ns,
+		baseline and vsC(ns, baseline[size] and baseline[size].parse) or "")
+end
+bench("json5 with comments", function() json.decode(fixtures.JSON5_SRC) end, 5000)
 
-ansi.printf("\n{bold}json.encode (parsed handle, no Lua tables){reset}")
-local smallDoc, mediumDoc, largeDoc = json.decode(SMALL), json.decode(MEDIUM), json.decode(LARGE)
-bench("small object", function() json.encode(smallDoc) end, 20000)
-bench("medium array", function() json.encode(mediumDoc) end, 2000)
-bench("large array", function() json.encode(largeDoc) end, 100)
+ansi.printf("\n{gray}decode + read one nested field{reset}")
+local reads = {
+	{ "small.name", "small", function() return json.decode(small):get("name"):val() end },
+	{ "medium.users[10].name", "medium", function() return json.decode(medium):get("users"):get(10):get("name"):val() end },
+	{ "large.[250].tags[2]", "large", function() return json.decode(large):get(250):get("tags"):get(2):val() end },
+}
+for _, case in ipairs(reads) do
+	local ns = benchNs(case[3], fixtures.ITERS[case[2]])
+	ansi.printf("  {gray}%-30s{reset} {bold}%10.1f ns/op{reset}%s", case[1], ns,
+		baseline and vsC(ns, baseline[case[2]] and baseline[case[2]].scrape) or "")
+end
 
-ansi.printf("\n{bold}json.edit{reset}")
-bench("parse + set + encode (small)", function()
-	local doc = json.edit.parse(SMALL)
+ansi.printf("\n{gray}decode + unpack: copy everything into Lua tables{reset}")
+for _, size in ipairs(fixtures.SIZES) do
+	local src = fixtures.source(size)
+	bench(size, function() json.decode(src):unpack() end, fixtures.ITERS[size] / 4)
+end
+
+ansi.printf("\n{gray}encode: parsed handle back to text{reset}")
+for _, size in ipairs(fixtures.SIZES) do
+	local ns = benchNs(function() json.encode(decoded[size]) end, fixtures.ITERS[size])
+	ansi.printf("  {gray}%-30s{reset} {bold}%10.1f ns/op{reset}%s", size, ns,
+		baseline and vsC(ns, baseline[size] and baseline[size].encode) or "")
+end
+
+ansi.printf("\n{gray}encode: unpacked Lua tables{reset}")
+-- unpacked up front, so the row measures the encoder and not the unpack
+local plain = {
+	small = decoded.small:unpack(),
+	medium = decoded.medium:unpack(),
+	large = decoded.large:unpack(),
+}
+bench("small object", function() json.encode(plain.small) end, 5000)
+bench("medium array", function() json.encode(plain.medium) end, 500)
+bench("large array", function() json.encode(plain.large) end, 20)
+
+ansi.printf("\n{gray}json.edit: parse, change one field, encode{reset}")
+bench("small", function()
+	local doc = json.edit.parse(small)
 	doc:root():set("age", 31)
 	return doc:encode()
 end, 5000)
-bench("parse + navigate + encode (large)", function()
-	local doc = json.edit.parse(LARGE)
+bench("large", function()
+	local doc = json.edit.parse(large)
 	doc:root():get(250):set("name", "renamed")
 	return doc:encode()
 end, 100)
 
-ansi.printf("\n{bold}cjson decode{reset}")
-bench("small object (~40 B)", function() cjson.decode(SMALL) end, 5000)
-bench("medium array (~20 objs)", function() cjson.decode(MEDIUM) end, 500)
-bench("large array (~500 objs)", function() cjson.decode(LARGE) end, 20)
-
-ansi.printf("\n{bold}cjson encode{reset}")
-bench("small object", function() cjson.encode(cjson.decode(SMALL)) end, 5000)
-bench("medium array", function() cjson.encode(cjson.decode(MEDIUM)) end, 500)
-bench("large array", function() cjson.encode(cjson.decode(LARGE)) end, 20)
+if not baseline then
+	ansi.printf("\n{yellow}note{reset}: no C baseline found; the package build compiles it\n")
+end
