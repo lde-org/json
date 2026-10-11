@@ -125,16 +125,21 @@ build:write(srcDir .. "/shim.c", shim)
 -- Compile yyjson + shim into one shared library, in the build output dir.
 -- (A plain cmake build would not include the shim, and its inline helpers are
 -- exactly the editing API this package needs.)
-build:cc({
+local args = {
 	"-O2",
-	"-fPIC",
 	"-shared",
 	"-I" .. srcDir .. "/src",
 	srcDir .. "/src/yyjson.c",
 	srcDir .. "/shim.c",
 	"-o",
 	libName,
-})
+}
+
+if not isWindows then
+	table.insert(args, 2, "-fPIC")
+end
+
+build:cc(args)
 
 if not isWindows then
 	local stripFlags = isMac and "-x" or "--strip-unneeded"
